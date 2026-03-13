@@ -188,23 +188,48 @@ Use Agno as the **orchestrator** (workflow management, task decomposition, state
 4. **Claude Code** inside the container does the actual work (inference + tool use), authenticated via Max plan
 5. **Results** returned as JSON to Agno, which aggregates and manages state
 
-### Auth in Docker
-- **Mount `~/.claude/`** into containers for OAuth token persistence
-- Claude Code stores tokens in `~/.claude/.credentials.json` (Linux)
-- **Known issue**: OAuth token refresh race condition when multiple containers share the same token file
-- **Mitigation**: Use a token proxy/mutex, or serialize container launches, or use separate sessions
+### Auth in Docker: The `setup-token` Solution
+
+**Critical discovery**: `claude setup-token` generates a **1-year OAuth token** specifically designed for automated/headless workflows. This eliminates the OAuth refresh race condition entirely.
+
+```bash
+# On your host machine (one-time, interactive):
+claude setup-token
+# Produces a long-lived token like: sk-ant-oat01-...
+
+# Pass to any Docker container:
+docker run --rm \
+  -e CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-..." \
+  -v $(pwd):/workspace \
+  deerflow-worker \
+  claude -p "your task" --output-format json
+```
+
+**Auth methods ranked for Docker:**
+
+| Method | Lifetime | Race-Safe | Recommended |
+|---|---|---|---|
+| `CLAUDE_CODE_OAUTH_TOKEN` (via `setup-token`) | ~1 year | Yes | **Best for containers** |
+| `ANTHROPIC_API_KEY` | Permanent | Yes | Uses API billing, not Max plan |
+| Volume mount `~/.claude/` | ~6-8 hours | No (race condition) | Not recommended |
+
+**Security**: Never bake tokens into images. Use `-e` flag, Docker secrets, or a secrets manager (Vault, 1Password, etc.).
 
 ### Docker Worker Image
 ```dockerfile
-FROM ubuntu:24.04
+FROM node:20-slim
 
-# Install Claude Code
-RUN curl -o /tmp/install.sh \
-      https://storage.googleapis.com/claude-code-releases/latest/install.sh && \
-    bash /tmp/install.sh && rm /tmp/install.sh
+# Install Claude Code CLI
+RUN npm install -g @anthropic-ai/claude-code
 
 # Install common tools
-RUN apt-get update && apt-get install -y git python3 nodejs npm
+RUN apt-get update && apt-get install -y git python3 curl && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Non-root user for security
+RUN useradd -m worker
+USER worker
+WORKDIR /workspace
 
 # Pre-configure for headless use
 ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
@@ -212,16 +237,24 @@ ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 ENTRYPOINT ["claude"]
 ```
 
+### Existing Docker Projects (Reference)
+Several community projects already solve this pattern:
+- **[cabinlab/claude-code-sdk-docker](https://github.com/cabinlab/claude-code-sdk-docker)** — Pre-built images for both TS (~200MB) and Python (~693MB) SDKs, works with Pro/Max plans
+- **[ClaudeBox](https://github.com/RchGrav/claudebox)** — Pre-configured profiles, multi-instance support, network isolation
+- **[claude-code-container](https://github.com/tintinweb/claude-code-container)** — Non-root execution, capability dropping, PID limits, tmpfs mounts
+- **[Docker Sandboxes](https://docs.docker.com/ai/sandboxes/)** — Docker's official solution for running coding agents unsupervised
+
 ### Pros
 - All inference on Max plan — no API costs
+- `setup-token` provides 1-year auth tokens, safe for concurrent containers
 - Agno provides clean workflow orchestration, customizable routing
 - Claude Code gets full tool access (Bash, files, web search) inside each container
 - Each container is isolated (sandboxed by Docker)
 - Highly customizable — Agno workflows can be arbitrarily complex
+- Existing Docker images available (claude-code-sdk-docker, ClaudeBox, etc.)
 
 ### Cons
-- Container startup latency (~2-5 seconds per Docker container)
-- OAuth token sharing across containers is fragile (race conditions on refresh)
+- Container startup latency (~2-5 seconds per Docker container, mitigated with warm pools)
 - Max plan rate limits shared across all concurrent containers
 - More complex infrastructure (Docker daemon, container management)
 - Agno's LLM-based Team routing wouldn't work (no direct API access) — routing must be rule-based or use a local model
@@ -279,46 +312,82 @@ Skip both Agno and LangGraph entirely. Use the **Claude Agent SDK** (`claude-age
 ```
 
 ### How It Works
-1. The Claude Agent SDK spawns Claude Code as a subprocess
-2. It authenticates via Max plan OAuth (same as `claude` CLI)
-3. DeerFlow's tools are exposed as MCP servers that Claude Code connects to
-4. The SDK provides streaming, structured output, session management
+1. `pip install claude-agent-sdk` — this **bundles the Claude Code CLI** automatically
+2. The SDK spawns Claude Code as a subprocess under the hood
+3. It authenticates via `CLAUDE_CODE_OAUTH_TOKEN` (setup-token, Max plan) or `ANTHROPIC_API_KEY`
+4. DeerFlow's tools are exposed as MCP servers (or in-process via `@tool` decorator)
+5. The SDK provides streaming, structured output, session management, hooks
 
 ### Key Agent SDK Features
 ```python
-from claude_agent_sdk import query, ClaudeAgentOptions
+from claude_agent_sdk import query, ClaudeAgentOptions, tool, create_sdk_mcp_server
 
-# One-off query
+# Custom in-process tool (zero subprocess overhead)
+@tool("search_memory", "Search DeerFlow memory", {"query": str})
+async def search_memory(args):
+    results = memory_store.search(args["query"])
+    return {"content": [{"type": "text", "text": json.dumps(results)}]}
+
+memory_server = create_sdk_mcp_server(name="deerflow", tools=[search_memory])
+
+# One-off query with Max plan auth
 async for message in query(
     prompt="Analyze the codebase and fix auth bug",
     options=ClaudeAgentOptions(
-        allowed_tools=["Read", "Edit", "Bash", "mcp__deerflow__*"],
+        allowed_tools=["Read", "Edit", "Bash", "mcp__deerflow__search_memory"],
         mcp_servers={
-            "deerflow": {"type": "stdio", "command": "python", "args": ["-m", "deerflow_mcp"]}
+            "deerflow_memory": memory_server,  # In-process, no subprocess
+            "deerflow_tools": {                 # External MCP server
+                "type": "stdio",
+                "command": "python",
+                "args": ["-m", "deerflow_mcp"],
+            },
         },
         max_turns=20,
-        output_format="stream-json",
     ),
 ):
     if hasattr(message, "result"):
         print(message.result)
 ```
 
+### Multi-Turn Conversations
+```python
+from claude_agent_sdk import ClaudeSDKClient
+
+async with ClaudeSDKClient(options=options) as client:
+    await client.query("What's in this codebase?")
+    async for msg in client.receive_response():
+        print(msg)
+    # Follow-up maintains full context:
+    await client.query("Now fix the auth bug you found")
+    async for msg in client.receive_response():
+        print(msg)
+```
+
+### Hooks for Middleware-Like Behavior
+```python
+# Hooks fire at specific points in the agent loop:
+# PreToolUse, PostToolUse, PostToolUseFailure, Stop, SubagentStart
+# Can block operations, inject messages, control flow
+```
+
 ### Pros
 - **Simplest architecture** — Agent SDK handles the agent loop natively
-- All inference on Max plan (SDK uses Claude Code auth)
+- All inference on Max plan via `CLAUDE_CODE_OAUTH_TOKEN`
 - Claude Code's built-in tools (Read, Edit, Bash, Glob, Grep, WebSearch) are free
+- In-process `@tool` decorator = zero-overhead custom tools (no subprocess)
 - DeerFlow-specific capabilities exposed via MCP servers
 - Streaming, sessions, structured output all handled by SDK
 - No Docker overhead for the main agent loop
+- **Hooks** provide middleware-like interception points (PreToolUse, PostToolUse, Stop, etc.)
+- `can_use_tool` callback enables programmatic permission control
 
 ### Cons
 - **Less customizable** — you're locked into Claude Code's agent loop and tool set
 - No multi-model support (Claude only, no GPT-4o/Gemini fallbacks)
 - Task decomposition/routing relies on Claude's own reasoning (not explicit workflow)
 - Agent SDK is relatively new — less mature than Agno/LangGraph
-- **Requires `ANTHROPIC_API_KEY` for programmatic use** — the Agent SDK documentation indicates API key auth for headless, which may bill separately from Max plan (needs verification)
-- DeerFlow's middleware pattern doesn't map cleanly to MCP servers
+- DeerFlow's 11-middleware chain only partially maps to SDK hooks
 
 ---
 
@@ -509,11 +578,12 @@ For completeness, here's the Agno migration analysis if using Option A:
 
 | Concern | Impact on All Options |
 |---|---|
-| **Max plan rate limits** | All concurrent Claude Code instances share the same weekly cap. Heavy use could exhaust limits. |
-| **OAuth token race condition** | Multiple containers refreshing the same token simultaneously causes auth failures. Need a token proxy or serialization. |
-| **Container cold start** | Docker containers add ~2-5s latency per task dispatch. Can be mitigated with warm pools. |
-| **No API key fallback on Max plan** | If Max plan limits are hit, you can't seamlessly fall back to API billing without reconfiguring auth. |
+| **Max plan rate limits** | All concurrent Claude Code instances share the same weekly cap. Max $200/month ≈ ~900 messages per 5-hour window. Heavy parallel use could exhaust limits. |
+| **Auth solved by `setup-token`** | `claude setup-token` generates a 1-year token (`CLAUDE_CODE_OAUTH_TOKEN`). Safe for concurrent use across multiple containers — no refresh race condition. |
+| **Container cold start** | Docker containers add ~2-5s latency per task dispatch. Mitigate with warm container pools or use Agent SDK (no container overhead). |
+| **API key fallback** | If Max plan limits are hit, you can set `ANTHROPIC_API_KEY` on specific containers to fall back to API billing for overflow. |
 | **Experimental features** | Claude Code Agent Teams and some Agent SDK features are experimental. |
+| **`--dangerously-skip-permissions`** | For fully unattended containers, this flag skips all permission prompts. Use with network isolation (firewall rules, Docker networking). |
 
 ---
 
@@ -537,17 +607,20 @@ Given the requirements of:
 
 ### Suggested Implementation Path
 
-1. **Start with a proof-of-concept**: Build a minimal Docker worker that runs `claude -p` and returns JSON results
-2. **Solve the auth problem**: Build a token proxy that serializes OAuth token refreshes across containers
-3. **Build the dispatcher**: Python class that manages Docker container lifecycle and result collection
-4. **Choose orchestrator**: Try Agno's Workflow primitives; if too constraining, fall back to custom Python
-5. **Migrate incrementally**: Port one DeerFlow capability at a time (e.g., web search first, then code execution, then memory)
-6. **Keep the frontend/Gateway**: The Next.js frontend and FastAPI gateway can remain largely unchanged
+1. **Generate a setup-token**: Run `claude setup-token` on your host to get a 1-year OAuth token for containers
+2. **Start with a proof-of-concept**: Build a minimal Docker worker that runs `claude -p` with `CLAUDE_CODE_OAUTH_TOKEN` and returns JSON results
+3. **Evaluate the Agent SDK**: Try `pip install claude-agent-sdk` and test `query()` with in-process `@tool` — this may be sufficient without Docker containers at all
+4. **Build the dispatcher**: If Docker is needed for isolation, build a Python class managing container lifecycle and result collection
+5. **Choose orchestrator**: Try Agno's Workflow primitives for task decomposition; if too constraining, fall back to custom Python
+6. **Port DeerFlow tools as MCP servers**: Package web search, memory, sandbox tools as MCP servers consumable by Claude Code
+7. **Migrate incrementally**: Port one capability at a time (web search first, then code execution, then memory)
+8. **Keep the frontend/Gateway**: The Next.js frontend and FastAPI gateway can remain largely unchanged
 
 ### What NOT to Do
 - Don't migrate to Agno just for the framework — it doesn't solve Max plan billing
-- Don't run many concurrent Docker containers without rate limit awareness
-- Don't share OAuth tokens across containers without a coordination mechanism
+- Don't run many concurrent Docker containers without rate limit awareness (Max $200/month ≈ ~900 messages per 5-hour burst)
+- Don't bake `CLAUDE_CODE_OAUTH_TOKEN` into Docker images — use runtime env vars or secrets managers
+- Don't use `--dangerously-skip-permissions` without network isolation
 
 ---
 
@@ -581,7 +654,17 @@ Given the requirements of:
 - [Agent SDK MCP Integration](https://platform.claude.com/docs/en/agent-sdk/mcp)
 - [Claude Agent SDK GitHub](https://github.com/anthropics/claude-agent-sdk-python)
 
+### Docker Patterns
+- [cabinlab/claude-code-sdk-docker](https://github.com/cabinlab/claude-code-sdk-docker) — Pre-built SDK Docker images
+- [ClaudeBox](https://github.com/RchGrav/claudebox) — Multi-instance Docker management
+- [claude-code-container](https://github.com/tintinweb/claude-code-container) — Secure non-root container
+- [Docker Sandboxes for Coding Agents](https://docs.docker.com/ai/sandboxes/)
+- [Docker Sandboxes Blog Post](https://www.docker.com/blog/docker-sandboxes-run-claude-code-and-other-coding-agents-unsupervised-but-safely/)
+- [Dispatch Pattern (Multi-Agent)](https://github.com/bassimeledath/dispatch)
+
 ### Anthropic
 - [Claude Pro/Max Plan](https://support.claude.com/en/articles/11145838-using-claude-code-with-your-pro-or-max-plan)
 - [Anthropic API Rate Limits](https://platform.claude.com/docs/en/api/rate-limits)
 - [Anthropic API Pricing](https://www.nops.io/blog/anthropic-api-pricing/)
+- [Agent SDK Hosting & Isolation](https://platform.claude.com/docs/en/agent-sdk/hosting)
+- [Agent SDK Secure Deployment](https://platform.claude.com/docs/en/agent-sdk/secure-deployment)

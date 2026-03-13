@@ -1,0 +1,37 @@
+services:
+  # Build the worker image
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: deerflow-claude-worker:latest
+
+    # Auth: set CLAUDE_CODE_OAUTH_TOKEN in .env file or environment
+    # Generate with: claude setup-token
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+    # Mount workspace for file access
+    volumes:
+      - ./workspace:/workspace
+
+    # Network isolation: only allow outbound HTTPS
+    # (In production, use a firewall init script like Anthropic's devcontainer)
+    networks:
+      - worker-net
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+
+    # Default: just print help
+    # Override with: docker compose run worker -p "your prompt" --output-format json
+    command: ["--help"]
+
+networks:
+  worker-net:
+    driver: bridge

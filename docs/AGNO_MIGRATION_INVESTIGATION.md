@@ -1,8 +1,8 @@
-# DeerFlow to Agno Migration Investigation
+# DeerFlow Architecture Investigation: Agno, Claude Code, and Max Plan
 
 > **Date**: 2026-03-13
 > **Status**: Investigation / Analysis
-> **Scope**: Feasibility study for porting DeerFlow from LangGraph to Agno
+> **Scope**: Feasibility study for porting DeerFlow from LangGraph to Agno, with focus on Max plan integration via Claude Code as inference engine
 
 ---
 
@@ -11,20 +11,25 @@
 1. [Executive Summary](#executive-summary)
 2. [Current DeerFlow Architecture](#current-deerflow-architecture)
 3. [Agno Framework Overview](#agno-framework-overview)
-4. [Component-by-Component Migration Analysis](#component-by-component-migration-analysis)
-5. [Claude Code & Max Plan Integration](#claude-code--max-plan-integration)
-6. [Pros and Cons](#pros-and-cons)
-7. [Migration Effort Estimate](#migration-effort-estimate)
-8. [Recommendation](#recommendation)
-9. [Sources](#sources)
+4. [The Max Plan Problem](#the-max-plan-problem)
+5. [Architecture Option A: Agno + Claude Code Docker Workers](#architecture-option-a-agno--claude-code-docker-workers)
+6. [Architecture Option B: Claude Agent SDK Orchestrator](#architecture-option-b-claude-agent-sdk-orchestrator)
+7. [Architecture Option C: Lightweight Custom Orchestrator + Claude Code](#architecture-option-c-lightweight-custom-orchestrator--claude-code)
+8. [Claude Code Capabilities Reference](#claude-code-capabilities-reference)
+9. [Component-by-Component Migration Analysis (Agno)](#component-by-component-migration-analysis-agno)
+10. [Pros and Cons](#pros-and-cons)
+11. [Recommendation](#recommendation)
+12. [Sources](#sources)
 
 ---
 
 ## Executive Summary
 
-DeerFlow is currently built on **LangGraph + LangChain**, using an explicit graph/state-machine architecture with 11 custom middlewares, subagents, MCP support, sandbox execution, persistent memory, and a full Gateway API. Porting to **Agno** (formerly PhiData) would mean replacing the core orchestration layer while preserving the surrounding infrastructure (frontend, gateway API, sandbox, channels).
+DeerFlow is currently built on **LangGraph + LangChain**. The primary goal is to leverage the **Anthropic Max plan** ($100-$200/month) for inference rather than paying per-API-call, while maintaining a highly customizable multi-agent system.
 
-**The critical finding**: Agno agents require an `ANTHROPIC_API_KEY` for Claude models and use Anthropic's pay-as-you-go API billing. **The Anthropic Max plan ($100-$200/month) cannot be used to authenticate Agno agents** — Max plan authentication is OAuth-based and only works with claude.ai and Claude Code CLI. This is the single biggest consideration for this migration if the goal is to leverage a Max subscription.
+**Key finding**: No agent framework (Agno, LangGraph, CrewAI, etc.) can use the Max plan directly — they all require `ANTHROPIC_API_KEY` which bills separately. However, **Claude Code** (the CLI) authenticates via the Max plan and can run in headless mode (`-p` flag) with full tool access.
+
+**The most promising architecture**: Use a lightweight orchestrator (Agno, custom Python, or the Claude Agent SDK) to manage workflow and task decomposition, then **dispatch Docker containers running Claude Code** for actual inference and code execution. Each container authenticates against the Max plan, so all LLM costs are covered by the subscription.
 
 ---
 
@@ -45,7 +50,7 @@ DeerFlow is currently built on **LangGraph + LangChain**, using an explicit grap
 | Subagents | general-purpose (50 turns), bash specialist | `src/subagents/builtins/` |
 | Thread State | Custom `ThreadState` extending `AgentState` with sandbox, artifacts, todos, memory | `src/agents/thread_state.py` |
 | Middleware Chain | 11 middlewares in strict order (thread data, uploads, sandbox, dangling tool calls, summarization, todos, titles, memory, images, subagent limits, clarification) | `src/agents/middlewares/` |
-| Tools | Config-driven tool loading + MCP tools + built-in tools (present_files, ask_clarification, view_image) + sandbox tools (bash, ls, read, write, str_replace) | `src/tools/tools.py` |
+| Tools | Config-driven tool loading + MCP tools + built-in tools + sandbox tools (bash, ls, read, write, str_replace) | `src/tools/tools.py` |
 | Model Factory | Dynamic model instantiation via reflection, supports thinking/vision/reasoning | `src/models/factory.py` |
 | MCP | `langchain-mcp-adapters`, lazy init, cache invalidation, OAuth support | `src/mcp/` |
 | Memory | LLM-powered fact extraction, debounced updates, JSON storage | `src/agents/memory/` |
@@ -65,9 +70,9 @@ DeerFlow is currently built on **LangGraph + LangChain**, using an explicit grap
 ## Agno Framework Overview
 
 ### What is Agno?
-Agno (formerly PhiData) is an open-source Python framework for building multi-agent AI systems. It uses a three-layer architecture:
+Agno (formerly PhiData) is an open-source Python framework for building multi-agent AI systems. Three-layer architecture:
 
-1. **SDK Layer**: High-level abstractions — `Agent`, `Team`, `Workflow`, `Memory`, `Knowledge`, `Tools`
+1. **SDK Layer**: `Agent`, `Team`, `Workflow`, `Memory`, `Knowledge`, `Tools`
 2. **Engine Layer**: Model calls, tool orchestration, structured output handling
 3. **AgentOS Layer**: Production-ready FastAPI backend with streaming APIs, auth, tracing
 
@@ -81,295 +86,474 @@ Agno (formerly PhiData) is an open-source Python framework for building multi-ag
 | `Memory` | Custom state + checkpointer | Session state + long-term user memories + knowledge |
 | `MCPTools` | `langchain-mcp-adapters` | MCP client with stdio/HTTP/SSE transports |
 
-### Performance Claims
+### Performance
 - Agent instantiation: ~2 microseconds (~529x faster than LangGraph)
 - Memory per agent: ~3.75 KiB
+- 80+ built-in tool integrations, 40+ models across 20+ providers
 
-### Model Support
-40+ models across 20+ providers, including native Claude support:
-```python
-from agno.models.anthropic import Claude
-agent = Agent(model=Claude(id="claude-sonnet-4-6"))
-```
+### Customizability
+Agno is highly customizable:
+- **Custom tools**: `@tool` decorator on any Python function
+- **Custom workflows**: `Step`, `Parallel`, `Router`, `Loop`, `Condition` primitives
+- **Custom memory**: Pluggable database backends (SQLite, Postgres, etc.)
+- **MCP integration**: Both client and server, all transport types
+- **Model-agnostic**: Swap models with a single line change
+- **Pre/post hooks**: On every tool via `Function(pre_hooks=[], post_hooks=[])`
 
 ---
 
-## Component-by-Component Migration Analysis
+## The Max Plan Problem
 
-### 1. Lead Agent → Agno Agent
-**Difficulty: Medium**
+### Why This Matters
+The Anthropic Max plan ($100-$200/month) provides generous Claude usage (hundreds of hours of Sonnet, tens of hours of Opus per week) via **OAuth-based authentication**. But every agent framework (Agno, LangGraph, CrewAI, etc.) requires `ANTHROPIC_API_KEY` which uses **separate pay-as-you-go billing**.
 
-DeerFlow's lead agent would map to an Agno `Agent`. The core agent creation is straightforward:
-```python
-# Current (LangGraph)
-agent = create_agent(model, tools, prompt)
+| Access Method | Auth Type | Billing | Works With |
+|---|---|---|---|
+| claude.ai | OAuth (Max plan) | Subscription | Web UI only |
+| Claude Code CLI | OAuth (Max plan) | Subscription | CLI, headless mode, Agent SDK |
+| Anthropic API | API key | Pay-per-token | All frameworks (Agno, LangGraph, etc.) |
 
-# Agno equivalent
-agent = Agent(model=Claude(), tools=[...], instructions=[...])
+### The Insight
+**Claude Code is the bridge.** It authenticates via Max plan OAuth and can run in headless mode with full tool access (Bash, file I/O, web search, etc.). If we use Claude Code as the "inference engine" inside Docker containers, the orchestrator doesn't need API keys at all — it just dispatches work to Claude Code instances.
+
+---
+
+## Architecture Option A: Agno + Claude Code Docker Workers
+
+### Concept
+Use Agno as the **orchestrator** (workflow management, task decomposition, state) but replace direct LLM API calls with **Claude Code running inside Docker containers**. Agno handles the "what" (task planning, routing, state management), Claude Code handles the "how" (inference, code execution, tool use).
+
+### Architecture Diagram
+```
+┌──────────────────────────────────────────────────┐
+│                  DeerFlow Frontend                │
+│                   (Next.js)                       │
+└─────────────────────┬────────────────────────────┘
+                      │
+┌─────────────────────▼────────────────────────────┐
+│              Gateway API (FastAPI)                 │
+│     Models │ MCP │ Skills │ Memory │ Uploads      │
+└─────────────────────┬────────────────────────────┘
+                      │
+┌─────────────────────▼────────────────────────────┐
+│           Agno Orchestrator Layer                  │
+│                                                    │
+│  ┌─────────┐  ┌──────────┐  ┌─────────────────┐  │
+│  │Workflow  │  │  Team    │  │  State/Memory   │  │
+│  │(Steps,  │  │(Route to │  │  (session_state  │  │
+│  │ Parallel,│  │ right    │  │   + SqliteDb)   │  │
+│  │ Router) │  │ worker)  │  │                  │  │
+│  └────┬────┘  └────┬─────┘  └─────────────────┘  │
+│       │            │                               │
+│  ┌────▼────────────▼──────────────────────────┐   │
+│  │        Docker Dispatch Manager              │   │
+│  │  • Spawns Claude Code containers            │   │
+│  │  • Passes task prompt + allowed tools       │   │
+│  │  • Collects results (JSON output)           │   │
+│  │  • Manages container lifecycle              │   │
+│  └────┬───────────┬──────────────┬────────────┘   │
+└───────│───────────│──────────────│─────────────────┘
+        │           │              │
+   ┌────▼───┐  ┌───▼────┐  ┌─────▼──────┐
+   │Docker  │  │Docker  │  │Docker      │
+   │Worker 1│  │Worker 2│  │Worker N    │
+   │        │  │        │  │            │
+   │Claude  │  │Claude  │  │Claude      │
+   │Code    │  │Code    │  │Code        │
+   │(Max $$)│  │(Max $$)│  │(Max $$)    │
+   │        │  │        │  │            │
+   │-p mode │  │-p mode │  │-p mode     │
+   │+tools  │  │+tools  │  │+tools      │
+   └────────┘  └────────┘  └────────────┘
+        All inference billed to Max plan
 ```
 
-**Challenge**: DeerFlow's 11-middleware chain has no direct Agno equivalent. Each middleware would need to be reimplemented as either:
-- Pre/post hooks on tools (`Function(pre_hooks=[], post_hooks=[])`)
-- Custom logic wrapping agent execution
-- Agno's built-in features (where they overlap, e.g., memory)
+### How It Works
 
-### 2. Middleware Chain → Custom Orchestration
-**Difficulty: High**
+1. **Request arrives** at Gateway API
+2. **Agno orchestrator** decomposes the task using its Workflow/Team primitives
+   - Agno itself does NOT call any LLM — it uses predefined routing logic
+   - Or, optionally, uses a cheap local model (Ollama) for task decomposition
+3. **Docker Dispatch Manager** spawns a container for each task:
+   ```bash
+   docker run --rm \
+     -v ~/.claude:/home/user/.claude \
+     -v /workspace:/workspace \
+     deerflow-worker \
+     claude -p "Research the latest AI news and summarize findings" \
+       --allowedTools "Read,Write,Bash,WebSearch,WebFetch" \
+       --output-format json \
+       --max-turns 10
+   ```
+4. **Claude Code** inside the container does the actual work (inference + tool use), authenticated via Max plan
+5. **Results** returned as JSON to Agno, which aggregates and manages state
 
-This is the hardest part of the migration. DeerFlow's middleware chain provides cross-cutting concerns that Agno doesn't have a native pattern for:
+### Auth in Docker
+- **Mount `~/.claude/`** into containers for OAuth token persistence
+- Claude Code stores tokens in `~/.claude/.credentials.json` (Linux)
+- **Known issue**: OAuth token refresh race condition when multiple containers share the same token file
+- **Mitigation**: Use a token proxy/mutex, or serialize container launches, or use separate sessions
 
-| Middleware | Agno Equivalent | Effort |
+### Docker Worker Image
+```dockerfile
+FROM ubuntu:24.04
+
+# Install Claude Code
+RUN curl -o /tmp/install.sh \
+      https://storage.googleapis.com/claude-code-releases/latest/install.sh && \
+    bash /tmp/install.sh && rm /tmp/install.sh
+
+# Install common tools
+RUN apt-get update && apt-get install -y git python3 nodejs npm
+
+# Pre-configure for headless use
+ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+ENTRYPOINT ["claude"]
+```
+
+### Pros
+- All inference on Max plan — no API costs
+- Agno provides clean workflow orchestration, customizable routing
+- Claude Code gets full tool access (Bash, files, web search) inside each container
+- Each container is isolated (sandboxed by Docker)
+- Highly customizable — Agno workflows can be arbitrarily complex
+
+### Cons
+- Container startup latency (~2-5 seconds per Docker container)
+- OAuth token sharing across containers is fragile (race conditions on refresh)
+- Max plan rate limits shared across all concurrent containers
+- More complex infrastructure (Docker daemon, container management)
+- Agno's LLM-based Team routing wouldn't work (no direct API access) — routing must be rule-based or use a local model
+
+---
+
+## Architecture Option B: Claude Agent SDK Orchestrator
+
+### Concept
+Skip both Agno and LangGraph entirely. Use the **Claude Agent SDK** (`claude-agent-sdk` Python package) as the orchestrator. It provides the same tools and agent loop as Claude Code, callable programmatically from Python.
+
+### Architecture Diagram
+```
+┌──────────────────────────────────────────────────┐
+│                  DeerFlow Frontend                │
+│                   (Next.js)                       │
+└─────────────────────┬────────────────────────────┘
+                      │
+┌─────────────────────▼────────────────────────────┐
+│              Gateway API (FastAPI)                 │
+└─────────────────────┬────────────────────────────┘
+                      │
+┌─────────────────────▼────────────────────────────┐
+│          Claude Agent SDK Orchestrator             │
+│                                                    │
+│  from claude_agent_sdk import query,               │
+│       ClaudeAgentOptions                           │
+│                                                    │
+│  async for msg in query(                           │
+│      prompt="Research AI news",                    │
+│      options=ClaudeAgentOptions(                   │
+│          allowed_tools=["Read","Bash","WebSearch"],│
+│          mcp_servers={                             │
+│              "deerflow": {                         │
+│                  "type": "stdio",                  │
+│                  "command": "python",              │
+│                  "args": ["-m", "deerflow.mcp"]    │
+│              }                                     │
+│          },                                        │
+│          max_turns=10,                             │
+│      ),                                            │
+│  ):                                                │
+│      handle(msg)                                   │
+│                                                    │
+│  ┌──────────────────────────────────────────┐     │
+│  │         DeerFlow MCP Servers              │     │
+│  │  • Sandbox tools (bash, file I/O)         │     │
+│  │  • Memory (read/write facts)              │     │
+│  │  • Skills (load/invoke)                   │     │
+│  │  • Web tools (search, fetch, scrape)      │     │
+│  └──────────────────────────────────────────┘     │
+└───────────────────────────────────────────────────┘
+        All inference billed to Max plan
+          (Agent SDK uses Claude Code auth)
+```
+
+### How It Works
+1. The Claude Agent SDK spawns Claude Code as a subprocess
+2. It authenticates via Max plan OAuth (same as `claude` CLI)
+3. DeerFlow's tools are exposed as MCP servers that Claude Code connects to
+4. The SDK provides streaming, structured output, session management
+
+### Key Agent SDK Features
+```python
+from claude_agent_sdk import query, ClaudeAgentOptions
+
+# One-off query
+async for message in query(
+    prompt="Analyze the codebase and fix auth bug",
+    options=ClaudeAgentOptions(
+        allowed_tools=["Read", "Edit", "Bash", "mcp__deerflow__*"],
+        mcp_servers={
+            "deerflow": {"type": "stdio", "command": "python", "args": ["-m", "deerflow_mcp"]}
+        },
+        max_turns=20,
+        output_format="stream-json",
+    ),
+):
+    if hasattr(message, "result"):
+        print(message.result)
+```
+
+### Pros
+- **Simplest architecture** — Agent SDK handles the agent loop natively
+- All inference on Max plan (SDK uses Claude Code auth)
+- Claude Code's built-in tools (Read, Edit, Bash, Glob, Grep, WebSearch) are free
+- DeerFlow-specific capabilities exposed via MCP servers
+- Streaming, sessions, structured output all handled by SDK
+- No Docker overhead for the main agent loop
+
+### Cons
+- **Less customizable** — you're locked into Claude Code's agent loop and tool set
+- No multi-model support (Claude only, no GPT-4o/Gemini fallbacks)
+- Task decomposition/routing relies on Claude's own reasoning (not explicit workflow)
+- Agent SDK is relatively new — less mature than Agno/LangGraph
+- **Requires `ANTHROPIC_API_KEY` for programmatic use** — the Agent SDK documentation indicates API key auth for headless, which may bill separately from Max plan (needs verification)
+- DeerFlow's middleware pattern doesn't map cleanly to MCP servers
+
+---
+
+## Architecture Option C: Lightweight Custom Orchestrator + Claude Code
+
+### Concept
+Build a minimal custom Python orchestrator (no framework) that manages task queuing, state, and Docker lifecycle. Dispatch all LLM work to Claude Code in Docker containers. Maximum customizability, minimum framework lock-in.
+
+### Architecture Diagram
+```
+┌──────────────────────────────────────────────────┐
+│                  DeerFlow Frontend                │
+│                   (Next.js)                       │
+└─────────────────────┬────────────────────────────┘
+                      │
+┌─────────────────────▼────────────────────────────┐
+│              Gateway API (FastAPI)                 │
+└─────────────────────┬────────────────────────────┘
+                      │
+┌─────────────────────▼────────────────────────────┐
+│        Custom Python Orchestrator                  │
+│                                                    │
+│  • Task queue (Redis/in-memory)                    │
+│  • State management (SQLite/Postgres)              │
+│  • Docker container lifecycle                      │
+│  • Result aggregation                              │
+│  • MCP server registry                             │
+│  • Memory system (reuse from DeerFlow)             │
+│  • Middleware pipeline (reuse from DeerFlow)        │
+│                                                    │
+│  class TaskDispatcher:                             │
+│      async def dispatch(self, task) -> Result:     │
+│          container = await self.docker.run(         │
+│              image="deerflow-worker",              │
+│              cmd=["claude", "-p", task.prompt,      │
+│                   "--allowedTools", task.tools,     │
+│                   "--output-format", "json"],       │
+│              volumes={...},                         │
+│              mcp_config=task.mcp_servers,           │
+│          )                                         │
+│          return await container.wait_for_result()   │
+│                                                    │
+│  class WorkflowEngine:                             │
+│      async def run(self, workflow_def):             │
+│          for step in workflow_def.steps:            │
+│              if step.parallel:                      │
+│                  results = await gather(            │
+│                      *[self.dispatch(t)             │
+│                        for t in step.tasks])        │
+│              else:                                  │
+│                  result = await self.dispatch(      │
+│                      step.task)                     │
+└───────────────────────────────────────────────────┘
+        │               │               │
+   ┌────▼───┐      ┌───▼────┐     ┌───▼────────┐
+   │Docker  │      │Docker  │     │Docker      │
+   │Claude  │      │Claude  │     │Claude      │
+   │Code    │      │Code    │     │Code        │
+   │Worker  │      │Worker  │     │Worker      │
+   └────────┘      └────────┘     └────────────┘
+```
+
+### Pros
+- **Maximum customizability** — every aspect is under your control
+- All inference on Max plan
+- Can reuse DeerFlow's existing middleware, memory, and sandbox code
+- No framework lock-in — swap any component independently
+- Docker provides natural sandboxing for code execution
+- Can add any workflow pattern without framework constraints
+
+### Cons
+- More code to write and maintain
+- No built-in multi-agent patterns (must build your own)
+- Same Docker/auth challenges as Option A
+- Need to implement your own streaming, session management, etc.
+
+---
+
+## Claude Code Capabilities Reference
+
+### Headless Mode (`-p` flag)
+
+| Flag | Purpose | Example |
 |---|---|---|
-| ThreadDataMiddleware | `session_state` + custom setup | Medium |
-| UploadsMiddleware | Custom pre-processing | Medium |
-| SandboxMiddleware | Custom lifecycle management | High |
-| DanglingToolCallMiddleware | May not be needed (different runtime) | Low |
-| SummarizationMiddleware | `add_history_to_context` + `num_history_runs` | Low |
-| TodoListMiddleware | `session_state` | Medium |
-| TitleMiddleware | Custom post-processing | Low |
-| MemoryMiddleware | Agno `Memory` (partial overlap) | Medium |
-| ViewImageMiddleware | Custom pre-processing | Medium |
-| SubagentLimitMiddleware | Custom wrapper around Team | Medium |
-| ClarificationMiddleware | Custom tool + interrupt logic | High |
+| `-p "prompt"` | Run in headless/non-interactive mode | `claude -p "Fix auth bug"` |
+| `--output-format` | Output: `text`, `json`, `stream-json` | `--output-format json` |
+| `--allowedTools` | Pre-approve tools | `--allowedTools "Read,Edit,Bash"` |
+| `--disallowedTools` | Block specific tools | `--disallowedTools "Bash(rm *)"` |
+| `--max-turns` | Limit agentic iterations | `--max-turns 10` |
+| `--max-budget-usd` | Set spending limit | `--max-budget-usd 5.00` |
+| `--mcp-config` | MCP server config file | `--mcp-config ./mcp.json` |
+| `--json-schema` | Validate output against schema | `--json-schema '{"type":"object",...}'` |
+| `--append-system-prompt` | Add custom instructions | `--append-system-prompt "Always be concise"` |
+| `--continue` / `-c` | Continue most recent conversation | `claude -p "next step" -c` |
+| `--resume` / `-r` | Resume specific session | `claude -p "continue" -r <session-id>` |
+| `--verbose` | Full turn-by-turn output | Shows tool calls and reasoning |
 
-### 3. Subagents → Agno Team
-**Difficulty: Medium**
+### Built-in Tools (Available in Headless Mode)
 
-DeerFlow's subagent system (general-purpose + bash) maps to Agno's `Team` with `TeamMode.HIERARCHICAL`:
-```python
-team = Team(
-    name="DeerFlow",
-    members=[general_purpose_agent, bash_agent],
-    mode=TeamMode.HIERARCHICAL,
-)
-```
-
-**Challenge**: DeerFlow has fine-grained control over subagent tool restrictions (e.g., no `task`, `ask_clarification` for subagents). Agno Teams allow per-member tool lists, so this is achievable.
-
-### 4. Thread State → session_state + Database
-**Difficulty: Medium**
-
-DeerFlow's `ThreadState` with custom reducers would map to Agno's `session_state` dict + a `db` backend:
-```python
-agent = Agent(
-    db=SqliteDb(db_file="deerflow.db"),
-    session_state={"sandbox": None, "artifacts": [], "todos": []},
-)
-```
-
-**Challenge**: DeerFlow's custom reducers (artifact deduplication, image merge/clear) would need manual implementation.
-
-### 5. Tools → Agno Tools
-**Difficulty: Low-Medium**
-
-Most DeerFlow tools have direct Agno equivalents:
-
-| DeerFlow Tool | Agno Equivalent |
+| Tool | Description |
 |---|---|
-| Tavily search/fetch | `TavilyTools` (built-in) |
-| DuckDuckGo image search | `DuckDuckGoTools` (built-in) |
-| Firecrawl | `FirecrawlTools` (built-in) |
-| Bash execution | `ShellTools` (built-in) |
-| File read/write | `FileTools` (built-in) |
-| Jina reader | Custom tool (wrap existing code) |
-| MCP tools | `MCPTools` / `MultiMCPTools` |
+| Read | Read any file |
+| Write | Create new files |
+| Edit | Precise edits to existing files |
+| Bash | Run terminal commands |
+| Glob | Find files by pattern |
+| Grep | Search file contents with regex |
+| WebSearch | Search the web |
+| WebFetch | Fetch and parse web pages |
+| Agent | Spawn subagents for specialized tasks |
 
-Custom tools (present_files, ask_clarification, view_image) would need reimplementation using Agno's `@tool` decorator.
+### Rate Limits (Max Plan)
 
-### 6. Model Factory → Agno Model Classes
-**Difficulty: Low**
+| Plan | 5-Hour Burst (Sonnet) | Weekly Cap |
+|---|---|---|
+| Max $100/month | ~225 messages | ~140-280 hours Sonnet, ~15-35 hours Opus |
+| Max $200/month | ~900 messages | ~240-480 hours Sonnet, ~24-40 hours Opus |
 
-DeerFlow's reflection-based model factory maps directly to Agno's model classes:
-```python
-# DeerFlow: dynamic via config
-model = create_chat_model(name="claude-sonnet-4-6")
-
-# Agno: explicit model classes
-from agno.models.anthropic import Claude
-from agno.models.openai import OpenAIChat
-model = Claude(id="claude-sonnet-4-6")
-```
-
-Agno natively supports OpenAI, Anthropic, Google, DeepSeek, Ollama, Groq, AWS Bedrock, Azure, and more.
-
-### 7. MCP Integration → MCPTools
-**Difficulty: Low**
-
-Both frameworks support MCP well:
-```python
-# DeerFlow: langchain-mcp-adapters
-from langchain_mcp_adapters import MultiServerMCPClient
-
-# Agno: native MCPTools
-from agno.tools.mcp import MCPTools, MultiMCPTools
-agent = Agent(tools=[MCPTools(url="http://localhost:8080/mcp")])
-```
-
-**Caveat**: There are reported bugs with Agno's remote MCP HTTP streaming + Claude models (works with OpenAI). The stdio transport works reliably.
-
-### 8. Memory System → Agno Memory
-**Difficulty: Medium**
-
-Agno has a built-in `Memory` system with `user_memories`, `cultural_knowledge`, and session summaries. However, DeerFlow's memory is more customized (confidence scores, debouncing, specific fact structure). Partial overlap exists — some custom logic would still be needed.
-
-### 9. Gateway API → Custom FastAPI (or AgentOS)
-**Difficulty: Medium-High**
-
-Two options:
-1. **Keep the existing Gateway API** and adapt it to call Agno agents instead of LangGraph
-2. **Use AgentOS** (Agno's built-in FastAPI backend) and extend it with DeerFlow-specific endpoints
-
-Option 1 is likely easier since DeerFlow's Gateway has 7 specialized routers that AgentOS doesn't replicate.
-
-### 10. Sandbox System → Custom Integration
-**Difficulty: High**
-
-Agno has no built-in sandbox abstraction. DeerFlow's entire sandbox system (provider interface, local/K8s providers, path translation, lifecycle management) would need to be preserved as custom code wrapping Agno agents.
-
-### 11. IM Channels → Custom Integration
-**Difficulty: Low**
-
-The channel bridges (Telegram, Slack, Feishu) are largely independent of the agent runtime. They communicate via the LangGraph SDK client, which would be replaced with direct Agno agent calls.
+### Concurrency Considerations
+- Multiple Claude Code instances **share the same Max plan rate limits**
+- OAuth token refresh has **no coordination** between instances — known race condition
+- Best practices: Use git worktrees for isolation, or serialize Docker container launches
+- Agent Teams feature (experimental) coordinates multiple Claude Code instances
 
 ---
 
-## Claude Code & Max Plan Integration
+## Component-by-Component Migration Analysis (Agno)
 
-This is the most critical consideration raised. Here's the detailed analysis:
+For completeness, here's the Agno migration analysis if using Option A:
 
-### How the Max Plan Works
-- **Max $100/month**: ~140-280 hours of Sonnet 4, ~15-35 hours of Opus 4 per week
-- **Max $200/month**: ~240-480 hours of Sonnet 4, ~24-40 hours of Opus 4 per week
-- **Authentication**: OAuth-based login (not API keys)
-- **Access surface**: claude.ai web interface and Claude Code CLI only
+### Components
 
-### The Problem with Agno + Max Plan
-**Agno agents require `ANTHROPIC_API_KEY`** to use Claude models. This key comes from the Anthropic Console (console.anthropic.com) and uses **pay-as-you-go API billing** — completely separate from the Max subscription.
-
-There is **no way to route Agno agent API calls through your Max plan subscription**. Setting `ANTHROPIC_API_KEY` in Claude Code actually switches Claude Code itself from Max plan billing to API billing.
-
-### The Problem with LangGraph + Max Plan (Current State)
-The same limitation applies to the **current** LangGraph-based DeerFlow: it uses `langchain-anthropic` which also requires `ANTHROPIC_API_KEY`. So **neither framework can use the Max plan** for agent API calls.
-
-### Possible Workarounds
-
-1. **Use Claude Code as the orchestrator directly**: Instead of running DeerFlow/Agno as a separate service, use Claude Code (which runs on Max plan) as the agent runtime, with DeerFlow tools exposed as MCP servers. This fundamentally changes the architecture but lets you leverage the Max plan.
-
-2. **Expose Agno agents as MCP servers for Claude Code**: Agno supports `enable_mcp_server=True` on AgentOS, which exposes agents as MCP tools. Claude Code could connect to these MCP servers. However, the Agno agents themselves would still need API keys for their LLM calls — this only helps if the Agno agents use non-Claude models (e.g., GPT-4o, Gemini) while Claude Code (on Max) does the primary reasoning.
-
-3. **Hybrid architecture**: Use Claude Code (Max plan) for the main agent loop, delegate specialized tasks to Agno agents running cheaper models (GPT-4o-mini, Haiku via API, open-source via Ollama).
-
-4. **Wait for Anthropic to offer API access in Max plan**: This is speculative — Anthropic may eventually bridge subscription and API billing, but there's no indication of this.
-
-### Bottom Line on Max Plan
-
-| Scenario | Max Plan Usable? |
-|---|---|
-| DeerFlow (current LangGraph) calling Claude API | No — requires API key |
-| DeerFlow ported to Agno calling Claude API | No — requires API key |
-| Claude Code as orchestrator + DeerFlow tools as MCP | Yes — Claude Code uses Max |
-| Agno agents exposed as MCP servers for Claude Code | Partially — Claude Code uses Max, but Agno sub-agents need API keys |
-
-**Migrating to Agno does not solve the Max plan integration problem.** The Max plan limitation is at the Anthropic authentication/billing layer, not the framework layer.
+| Component | Agno Equivalent | Effort | Notes |
+|---|---|---|---|
+| Lead Agent | `Agent` class | 1-2 days | Straightforward, but LLM calls go through Docker/Claude Code instead of direct API |
+| Middleware chain | No equivalent — custom code | 1-2 weeks | **Hardest part.** Must reimplement as pre/post hooks or custom wrappers |
+| Subagents | `Team(mode=HIERARCHICAL)` | 2-3 days | Per-member tool restrictions supported |
+| Thread State | `session_state` + `SqliteDb` | 2-3 days | Custom reducers need manual impl |
+| Tools | Agno built-in + `@tool` decorator | 3-5 days | Most have equivalents (Tavily, DuckDuckGo, Firecrawl, Shell, File) |
+| Model Factory | Agno model classes | 1 day | `Claude()`, `OpenAIChat()`, etc. |
+| MCP | `MCPTools` / `MultiMCPTools` | 1-2 days | Known bug with HTTP streaming + Claude |
+| Memory | Agno `Memory` | 3-5 days | Partial overlap; custom logic still needed |
+| Gateway API | Keep existing + adapt | 1 week | AgentOS doesn't cover all 7 routers |
+| Sandbox | Custom (no Agno equivalent) | 3-5 days | Must preserve existing code |
+| IM Channels | Replace LangGraph SDK calls | 2-3 days | Channels are framework-independent |
+| Embedded Client | Adapt to Agno | 1-2 days | |
+| **Total** | | **~4-8 weeks** | **High risk** |
 
 ---
 
 ## Pros and Cons
 
-### Pros of Migrating to Agno
+### Option A: Agno + Claude Code Docker Workers
 
-| Pro | Details |
+| Pros | Cons |
 |---|---|
-| **Simpler API surface** | Declarative `Agent`, `Team`, `Workflow` classes vs. explicit graph/state-machine construction. Less boilerplate. |
-| **Faster agent instantiation** | ~2 microseconds vs. LangGraph's heavier initialization. Could matter for high-throughput scenarios. |
-| **Lower memory footprint** | ~3.75 KiB per agent vs. LangGraph's larger footprint. |
-| **Native multi-agent patterns** | `Team` with hierarchical/collaborative/sequential modes built-in, vs. manually composing LangGraph subgraphs. |
-| **Rich built-in toolkit** | 80+ tool integrations out of the box (DuckDuckGo, Tavily, Firecrawl, Slack, Shell, File, etc.). Many DeerFlow community tools have Agno equivalents. |
-| **Model-agnostic by design** | Clean one-line model swapping. Native support for 40+ models across 20+ providers. |
-| **Built-in memory system** | User memories, cultural knowledge, session summaries — some overlap with DeerFlow's custom memory. |
-| **MCP bidirectional support** | Can act as both MCP client and MCP server. AgentOS exposes agents as MCP tools natively. |
-| **AgentOS production runtime** | Built-in FastAPI backend with streaming, auth, tracing, and 50+ APIs. Could replace some Gateway API functionality. |
-| **Active development** | Rapidly evolving framework with strong community (15k+ GitHub stars). |
-| **Workflow primitives** | `Step`, `Parallel`, `Router`, `Loop`, `Condition` for deterministic orchestration. |
+| All inference on Max plan | Container startup latency (~2-5s) |
+| Agno's clean workflow primitives | OAuth token sharing race condition |
+| 80+ built-in tool integrations | Rate limits shared across containers |
+| Highly customizable workflows | More complex infrastructure |
+| Model-agnostic (Agno can route to different models) | Agno's LLM-based routing needs local model or rules |
+| Bidirectional MCP support | 4-8 week migration from current LangGraph |
+| Active community (15k+ GitHub stars) | Less mature than LangGraph |
 
-### Cons of Migrating to Agno
+### Option B: Claude Agent SDK Orchestrator
 
-| Con | Details |
+| Pros | Cons |
 |---|---|
-| **Does NOT solve Max plan integration** | Agno still requires `ANTHROPIC_API_KEY` for Claude — same as LangGraph. No framework can use the Max subscription for API calls. |
-| **Massive middleware rewrite** | DeerFlow's 11-middleware chain has no Agno equivalent. Each middleware needs reimplementation as custom code, losing the clean middleware pattern. |
-| **Loss of fine-grained control** | LangGraph's explicit graph model gives precise control over execution flow, conditional branching, and state transitions. Agno's higher-level abstractions trade control for simplicity. |
-| **Sandbox system is custom** | Agno has no sandbox abstraction. The entire sandbox lifecycle (acquire, path translation, tool wrapping, K8s provider) must be preserved as custom code. |
-| **Known Claude-specific bugs** | Reported issues with structured outputs returning empty responses, and remote MCP HTTP streaming not working with Claude models. |
-| **Less mature than LangGraph** | LangGraph has a more established production track record and deeper LangChain ecosystem integration. |
-| **Breaking changes risk** | Agno recently rebranded from PhiData and is evolving rapidly. API stability is less proven than LangGraph. |
-| **Custom state reducers lost** | DeerFlow's custom reducers (artifact dedup, image merge/clear) have no Agno equivalent — need manual reimplementation. |
-| **Gateway API rework** | DeerFlow's 7-router Gateway API would need significant adaptation. AgentOS doesn't cover all the same endpoints (uploads, artifacts, suggestions, skills management). |
-| **Checkpointing differences** | LangGraph's `langgraph-checkpoint-sqlite` provides robust multi-turn persistence. Agno's `session_state` + `db` is simpler but less integrated. |
-| **LangSmith observability lost** | DeerFlow uses LangSmith tracing. Agno has its own tracing but it's a different ecosystem. |
-| **Large migration effort** | Estimated 4-8 weeks for a competent team, with high regression risk during the transition. |
+| Simplest architecture | Least customizable — locked into Claude Code's loop |
+| Native Max plan auth | Claude-only (no multi-model) |
+| All Claude Code tools built-in | Agent SDK is new, less mature |
+| Streaming + sessions handled | DeerFlow middleware pattern doesn't map to MCP |
+| No Docker overhead for main loop | May still require API key for programmatic use |
+| MCP servers for extensibility | Task routing relies on Claude's reasoning |
 
----
+### Option C: Custom Orchestrator + Claude Code Docker
 
-## Migration Effort Estimate
+| Pros | Cons |
+|---|---|
+| **Maximum customizability** | More code to write/maintain |
+| All inference on Max plan | No built-in multi-agent patterns |
+| Reuse existing DeerFlow code | Must build streaming, sessions yourself |
+| No framework lock-in | Same Docker/auth challenges as Option A |
+| Swap any component independently | |
+| Docker = natural sandbox | |
 
-| Component | Effort | Risk |
-|---|---|---|
-| Core agent (Lead Agent → Agno Agent) | 1-2 days | Low |
-| Middleware chain reimplementation | 1-2 weeks | **High** |
-| Subagent system → Team | 2-3 days | Medium |
-| Thread state → session_state | 2-3 days | Medium |
-| Tool migration | 3-5 days | Low |
-| Model factory → Agno models | 1 day | Low |
-| MCP integration | 1-2 days | Low-Medium |
-| Memory system | 3-5 days | Medium |
-| Gateway API adaptation | 1 week | Medium-High |
-| Sandbox system preservation | 3-5 days | High |
-| IM channel bridges | 2-3 days | Low |
-| Embedded client update | 1-2 days | Low |
-| Testing & regression fixes | 1-2 weeks | **High** |
-| **Total** | **~4-8 weeks** | **High overall** |
+### Cross-Cutting Concerns
+
+| Concern | Impact on All Options |
+|---|---|
+| **Max plan rate limits** | All concurrent Claude Code instances share the same weekly cap. Heavy use could exhaust limits. |
+| **OAuth token race condition** | Multiple containers refreshing the same token simultaneously causes auth failures. Need a token proxy or serialization. |
+| **Container cold start** | Docker containers add ~2-5s latency per task dispatch. Can be mitigated with warm pools. |
+| **No API key fallback on Max plan** | If Max plan limits are hit, you can't seamlessly fall back to API billing without reconfiguring auth. |
+| **Experimental features** | Claude Code Agent Teams and some Agent SDK features are experimental. |
 
 ---
 
 ## Recommendation
 
-### Should you migrate?
+### For Maximum Customizability + Max Plan: Option C (or A)
 
-**Not if the primary motivation is Max plan integration.** Neither Agno nor LangGraph can use the Anthropic Max subscription for API calls. This is an Anthropic billing/authentication limitation, not a framework limitation.
+Given the requirements of:
+1. **High customizability** — ability to control every aspect of the workflow
+2. **Max plan integration** — all inference billed to the subscription
+3. **Docker-based execution** — containers with Claude Code for inference
 
-### If you want Max plan integration specifically:
+**Option C (Custom Orchestrator)** is the most flexible. You can:
+- Reuse DeerFlow's existing middleware, memory, and sandbox code
+- Build exactly the workflow patterns you need
+- Add Docker container pooling for performance
+- Handle the OAuth token race condition with a custom token proxy
+- Add any model/framework later without constraints
 
-The most viable path is **restructuring DeerFlow as a set of MCP servers that Claude Code connects to**, rather than a standalone agent system. This lets Claude Code (running on Max plan) be the orchestrator, while DeerFlow provides specialized tools (sandbox, file management, web search, etc.) via MCP. This approach works with **either** framework.
+**Option A (Agno)** is a good middle ground if you want pre-built workflow primitives (Step, Parallel, Router, Loop, Condition) and team orchestration patterns without building them from scratch. Agno handles state, memory, and tool management, while Docker workers handle inference.
 
-### If you still want to evaluate Agno for other reasons:
+### Suggested Implementation Path
 
-Consider Agno if you want:
-- Simpler codebase with less boilerplate
-- Faster agent instantiation for high-throughput use cases
-- Built-in multi-agent team patterns
-- The ability to expose agents as MCP servers natively
-- A lighter-weight framework overall
+1. **Start with a proof-of-concept**: Build a minimal Docker worker that runs `claude -p` and returns JSON results
+2. **Solve the auth problem**: Build a token proxy that serializes OAuth token refreshes across containers
+3. **Build the dispatcher**: Python class that manages Docker container lifecycle and result collection
+4. **Choose orchestrator**: Try Agno's Workflow primitives; if too constraining, fall back to custom Python
+5. **Migrate incrementally**: Port one DeerFlow capability at a time (e.g., web search first, then code execution, then memory)
+6. **Keep the frontend/Gateway**: The Next.js frontend and FastAPI gateway can remain largely unchanged
 
-Stick with LangGraph if you need:
-- Fine-grained control over complex stateful workflows
-- The existing middleware pattern
-- Proven production stability
-- LangChain ecosystem integration (LangSmith, etc.)
-- Minimal migration risk
-
-### Suggested hybrid approach:
-
-Rather than a full port, consider:
-1. **Keep the current LangGraph core** for the main agent orchestration
-2. **Expose DeerFlow capabilities as MCP servers** for Claude Code integration
-3. **Experiment with Agno** for new, isolated features or subagents where its simpler API is beneficial
-4. **Re-evaluate** when Anthropic potentially bridges Max plan and API billing
+### What NOT to Do
+- Don't migrate to Agno just for the framework — it doesn't solve Max plan billing
+- Don't run many concurrent Docker containers without rate limit awareness
+- Don't share OAuth tokens across containers without a coordination mechanism
 
 ---
 
 ## Sources
 
+### Agno
 - [Agno Official Documentation](https://docs.agno.com)
 - [Agno GitHub Repository](https://github.com/agno-agi/agno)
 - [Agno Agent Framework](https://www.agno.com/agent-framework)
@@ -378,8 +562,26 @@ Rather than a full port, consider:
 - [Agno MCP Support](https://docs.agno.com/tools/mcp)
 - [Agno vs LangGraph - ZenML](https://www.zenml.io/blog/agno-vs-langgraph)
 - [Best AI Agent Frameworks 2025 - LangWatch](https://langwatch.ai/blog/best-ai-agent-frameworks-in-2025-comparing-langgraph-dspy-crewai-agno-and-more)
-- [Claude Code with Pro/Max Plan](https://support.claude.com/en/articles/11145838-using-claude-code-with-your-pro-or-max-plan)
-- [Anthropic API Pricing](https://www.nops.io/blog/anthropic-api-pricing/)
-- [Claude Agent SDK Overview](https://platform.claude.com/docs/en/agent-sdk/overview)
 - [Agno Bug: Claude Structured Outputs](https://github.com/agno-agi/agno/issues/2288)
 - [Agno Bug: Remote MCP with Claude](https://github.com/agno-agi/agno/issues/4384)
+
+### Claude Code & Max Plan
+- [Claude Code CLI Reference](https://code.claude.com/docs/en/cli-reference.md)
+- [Claude Code Headless Mode](https://code.claude.com/docs/en/headless.md)
+- [Claude Code Authentication](https://code.claude.com/docs/en/authentication.md)
+- [Claude Code Permissions](https://code.claude.com/docs/en/permissions.md)
+- [Claude Code Dev Containers](https://code.claude.com/docs/en/devcontainer.md)
+- [Claude Code on the Web](https://code.claude.com/docs/en/claude-code-on-the-web.md)
+- [Claude Code Agent Teams](https://code.claude.com/docs/en/agent-teams.md)
+- [Docker Sandboxes for Claude Code](https://www.docker.com/blog/docker-sandboxes-run-claude-code-and-other-coding-agents-unsupervised-but-safely/)
+
+### Claude Agent SDK
+- [Agent SDK Overview](https://platform.claude.com/docs/en/agent-sdk/overview)
+- [Agent SDK Python Reference](https://platform.claude.com/docs/en/agent-sdk/python)
+- [Agent SDK MCP Integration](https://platform.claude.com/docs/en/agent-sdk/mcp)
+- [Claude Agent SDK GitHub](https://github.com/anthropics/claude-agent-sdk-python)
+
+### Anthropic
+- [Claude Pro/Max Plan](https://support.claude.com/en/articles/11145838-using-claude-code-with-your-pro-or-max-plan)
+- [Anthropic API Rate Limits](https://platform.claude.com/docs/en/api/rate-limits)
+- [Anthropic API Pricing](https://www.nops.io/blog/anthropic-api-pricing/)
